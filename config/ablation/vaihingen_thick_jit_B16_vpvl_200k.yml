@@ -1,0 +1,51 @@
+logging:
+  output_dir: "exps"
+  exp_name: "vaihingen_thick_jit_B16_vpvl_200k"
+  logging_dir: "logs"
+  report_to: "wandb"
+  sampling_steps: 1000
+  resume_step: 0
+
+model:
+  model_name: 'JiT-B/16'
+  in_channels:  6
+  out_channels: 3
+  attn_dropout: 0.
+  proj_dropout: 0.
+
+sampling:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+  sampling_method: "heun" # [heun, euler]
+  num_sampling_steps: 4
+  prediction: "v"
+  loss: "v"
+
+dataset:
+  data_dir: "/224010098/DATASET/DACR/Vaihingen/"
+  cloud_type: 'thick'
+  resolution: 256
+  batch_size: 4
+  val_size: 100
+
+precision:
+  allow_tf32: true
+  mixed_precision: "fp16"   # choices: ["no", "fp16", "bf16"]
+
+optimization:
+  epochs: 1400
+  max_train_steps: 200000
+  checkpointing_steps: 20000
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-08
+  max_grad_norm: 1.0
+
+misc:
+  seed: 0
+  num_workers: 4

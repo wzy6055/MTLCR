@@ -1,0 +1,77 @@
+logging:
+  output_dir: "exps"
+  exp_name: "guangzhou256_jit_B16_400k"
+  logging_dir: "logs"
+  report_to: "wandb"
+  sampling_steps: 1000
+  resume_step: 0
+
+model:
+  model_name: 'JiT-B/16'
+  in_channels:  6
+  out_channels: 3
+  attn_dropout: 0.
+  proj_dropout: 0.
+#  patch_size: [2,2]
+#  widths: [128,256,512,1024]
+#  depths: [2,2,2,2]
+#  d_ffs: [256,512,1024,2048]
+#  self_attns: [
+#    {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+#    {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+#    {"type": "global", "d_head": 64},
+#    {"type": "global", "d_head": 64},
+#  ]
+#  dropout_rate: [0.0,0.0,0.0,0.1]
+#  mapping_depth: 2
+#  mapping_width: 1024
+#  mapping_d_ff: 2048
+#  mapping_dropout_rate: 0.1
+
+#repa:
+#  feat_path: "/224010098/workspace/REPACR/dataset_dino_v3/changsha256/dinov3_sat.npy"
+
+training:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 5e-2
+  noise_scale: 1.0
+#  ema_decay1: 0.9999
+#  ema_decay2: 0.9996
+  sampling_method: "heun" # [heun, euler]
+  num_sampling_steps: 4
+
+dataset:
+  data_dir: "/224010098/DATASET/DACR/CR/guangzhou256/"
+  resolution: 256
+  batch_size: 4
+  val_size: 100
+
+precision:
+  allow_tf32: false
+  mixed_precision: "fp16"   # choices: ["no", "fp16", "bf16"]
+
+optimization:
+  epochs: 1400
+  max_train_steps: 400000
+  checkpointing_steps: 20000
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-08
+  max_grad_norm: 1.0
+
+misc:
+  seed: 0
+  num_workers: 4
+
+loss:
+  path_type: "linear"   # choices: ["linear", "cosine"]
+  prediction: "v"       # currently only v-prediction supported
+  cfg_prob: 0.1
+  enc_type: "dinov2-vit-s"
+  proj_coeff: 0.5
+  weighting: "uniform"
+  legacy: false
