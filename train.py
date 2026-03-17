@@ -363,7 +363,7 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Training")
     parser.add_argument("--exp-name", type=str, default=None)
-    parser.add_argument("--config", type=str, default="config/vaihingen_thick_jit_B4_fm_200k.yml")
+    parser.add_argument("--config", type=str, default="config/vaihingen_thick_jit_B16_200k.yml")
     args = parser.parse_args()
     return args
 
