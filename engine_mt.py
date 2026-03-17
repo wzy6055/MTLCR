@@ -1,40 +1,14 @@
 import torch
-import numpy as np
-# import math
 import torch.nn.functional as F
 import torch.nn as nn
-# from einops import rearrange
-# from torchvision.utils import make_grid
 
 from util.evaluator import img_metrics, avg_img_metrics
-from util.cknna import AlignmentMetrics
 
 def mean_flat(x):
     """
     Take the mean over all non-batch dimensions.
     """
     return torch.mean(x, dim=list(range(1, len(x.size()))))
-
-class CKNNAAvgMeter:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.sum = 0.0
-        self.n = 0
-
-    def update(self, score):
-        # score 可以是 float / tensor / dict
-        if isinstance(score, dict):
-            score = next(iter(score.values()))
-        if hasattr(score, "item"):
-            score = score.item()
-        self.sum += score
-        self.n += 1
-
-    def value(self):
-        avg_score = self.sum / max(self.n, 1)
-        return {'CKNNA': avg_score}
 
 class mIoUAvgMeter:
     def __init__(self, num_classes, ignore_index=255):
@@ -129,7 +103,6 @@ class JiTEngine:
         self.noise_scale = config.sampling.noise_scale
         self.t_eps = config.sampling.t_eps
 
-        self.avg_cknna = CKNNAAvgMeter()
         self.avg_miou = mIoUAvgMeter(num_classes=6)
 
         assert self.method in ["heun", "euler"]
@@ -142,24 +115,6 @@ class JiTEngine:
     def sample_t(self, n: int, device=None):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
-
-    def get_proj_loss(self, zs, zs_tilde):
-        proj_loss = 0.
-        bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-            for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
-                z_j = torch.nn.functional.normalize(z_j, dim=-1)
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-        proj_loss /= (len(zs) * bsz)
-        return proj_loss
-
-    def get_seg_loss(self, pred, label, weights=None):
-        if weights == None:
-            weights = torch.ones(6).to(pred.device)
-        # label = label.long()
-        criterion = CrossEntropy2d_ignore()
-        return criterion(pred, label, weights)
 
     def __call__(self, batch):
         x, cond = batch['clear'].clone(), batch['cloudy'].clone()
@@ -174,20 +129,20 @@ class JiTEngine:
 
         # x-pred
         if self.prediction == "x":
-            output = self.model(z, t.flatten(), cond, return_f=True, return_seg=True)
-            x_pred, fs, seg_pred = output['x'], output['zs'], output['seg_pred']
+            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
+            x_pred = output['x']
             v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
             e_pred = (z - x_pred * t) / (1 - t).clamp_min(self.t_eps)
         # v-pred
         elif self.prediction == "v":
-            output = self.model(z, t.flatten(), cond, return_f=True, return_seg=True)
-            v_pred, fs, seg_pred = output['x'], output['zs'], output['seg_pred']
+            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
+            v_pred = output['x']
             x_pred = (1 - t) * v_pred + z
             e_pred = z - t * v_pred
         # e-pred
         elif self.prediction == "e":
-            output = self.model(z, t.flatten(), cond, return_f=True, return_seg=True)
-            e_pred, fs, seg_pred = output['x'], output['zs'], output['seg_pred']
+            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
+            e_pred = output['x']
             x_pred = (z - (1-t) * e_pred) / t.clamp_min(self.t_eps)
             v_pred = (z - e_pred) / t.clamp_min(self.t_eps)
 
@@ -204,24 +159,16 @@ class JiTEngine:
         # loss = loss.mean(dim=(1, 2, 3)).mean()
         denoising_loss = mean_flat(loss)
 
-        zs = batch['zs']
-        proj_loss = self.get_proj_loss(zs, fs)
-
-        seg_loss = self.get_seg_loss(pred=seg_pred, label=batch['mask'])
-
-        return denoising_loss, proj_loss, seg_loss
+        return denoising_loss
 
     @torch.no_grad()
     def test_step(self, batch):
         x, cond = batch['clear'].clone(), batch['cloudy'].clone()
-        f_target = batch['zs']
         device = cond.device
         bsz = cond.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        # samples = self.sample(cond, z, bsz=bsz, device=device)
-        # samples, fs = self.sample(cond, z, bsz=bsz, device=device, return_f=True, return_seg=True)
-        output = self.sample(cond, z, bsz=bsz, device=device, return_f=True, return_seg=True)
-        samples, fs, seg_pred = output['z_next'], output['zs'], output['seg_pred']
+        output = self.sample(cond, z, bsz=bsz, device=device, return_f=False, return_seg=False)
+        samples = output['z_next']
         for i in range(samples.shape[0]):
             _target = x[i, ...]
             _samples = samples[i, ...]
@@ -229,13 +176,6 @@ class JiTEngine:
             _samples = self.scale_01(_samples)
             metrics = img_metrics(target=_target.unsqueeze(0), pred=_samples.unsqueeze(0))
             self.avg_metrics.add(metrics)
-
-            # feats_A = F.normalize(fs[i].reshape(-1, fs[i].shape[-1]), dim=-1)
-            feats_A = F.normalize(fs[i], dim=-1)
-            feats_B = F.normalize(f_target[i], dim=-1)
-            cknna_score = AlignmentMetrics.measure('cknna', feats_A, feats_B, topk=10)
-            self.avg_cknna.update(cknna_score)
-            self.avg_miou.update(seg_pred, batch['mask'])
 
         return self.avg_metrics
 
@@ -254,22 +194,24 @@ class JiTEngine:
             t_next = timesteps[i + 1]
             output = stepper(output['z_next'], t, t_next, cond, return_f, return_seg)
         # last step euler
-        output = self._euler_step(z, timesteps[-2], timesteps[-1], cond, return_f, return_seg)
+        output = self._euler_step(output['z_next'], timesteps[-2], timesteps[-1], cond, return_f, return_seg)
         return output
 
     @torch.no_grad()
     def _forward_sample(self, z, t, cond, return_f=False, return_seg=False):
         if self.prediction == "x":
-            output = self.model(z, t.flatten(), cond, return_f, return_seg)
+            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
             x_cond = output['x']
             v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
             output['v_cond'] = v_cond
         # TODO: update v-pred and e-pred
         elif self.prediction == "v":
-            v_cond, f = self.model(z, t.flatten(), cond, return_f)
+            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
+            output['v_cond'] = output['x']
         elif self.prediction == "e":
-            e_cond, f= self.model(z, t.flatten(), cond, return_f)
-            v_cond = (z - e_cond) / t.clamp_min(self.t_eps)
+            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
+            e_cond = output['x']
+            output['v_cond'] = (z - e_cond) / t.clamp_min(self.t_eps)
         return output
 
     @torch.no_grad()
@@ -280,24 +222,28 @@ class JiTEngine:
         output['z_next'] = z_next
         return output
 
-    # TODO: update heun step
     @torch.no_grad()
-    def _heun_step(self, z, t, t_next, cond):
-        v_pred_t = self._forward_sample(z, t, cond)
+    def _heun_step(self, z, t, t_next, cond, return_f=False, return_seg=False):
+        output_t = self._forward_sample(z, t, cond, return_f, return_seg)
+        v_pred_t = output_t['v_cond']
 
         z_next_euler = z + (t_next - t) * v_pred_t
-        v_pred_t_next = self._forward_sample(z_next_euler, t_next, cond)
+        output_t_next = self._forward_sample(z_next_euler, t_next, cond, return_f, return_seg)
+        v_pred_t_next = output_t_next['v_cond']
 
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
         z_next = z + (t_next - t) * v_pred
-        return z_next
+
+        output = output_t_next if (return_f or return_seg) else {}
+        output['v_cond'] = v_pred
+        output['z_next'] = z_next
+        return output
 
     @torch.no_grad()
     def log_images(self, batch, sample=True):
         results = dict()
         results["input"] = self.scale_01(batch['clear'].clone().detach())
         results["cloudy"] = self.scale_01(batch['cloudy'].clone().detach())
-        results["mask_label"] = batch["mask"].clone().detach()
 
         x, cond = batch['clear'].clone(), batch['cloudy'].clone()
         device = cond.device
@@ -305,10 +251,8 @@ class JiTEngine:
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
 
         if sample:
-            output = self.sample(cond, z, bsz=bsz, device=device, return_seg=True)
+            output = self.sample(cond, z, bsz=bsz, device=device, return_f=False, return_seg=False)
             samples = output['z_next']
             results["samples"] = self.scale_01(samples)
-            mask_pred = output['seg_pred']
-            results["mask_pred"] = torch.argmax(mask_pred, dim=1)   # (B, H, W)
 
         return results

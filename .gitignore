@@ -3,3 +3,5 @@ dataset_dino_v3/
 wandb/
 src/
 .idea
+prompt.txt
+skills/

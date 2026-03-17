@@ -797,11 +797,11 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.tanh = nn.Tanh() if tanh else nn.Identity()
 
         # for repa
-        self.projector = build_mlp(1024, 2048, 1024)
+        # self.projector = build_mlp(1024, 2048, 1024)
 
         # for segmentation
-        self.seg_projector = build_mlp(1024, 2048, 1024)
-        self.seg_decoder = ProgressiveUpDecoder(in_channels=1024, num_classes=6)
+        # self.seg_projector = build_mlp(1024, 2048, 1024)
+        # self.seg_decoder = ProgressiveUpDecoder(in_channels=1024, num_classes=6)
 
         # init
         self.initialize_weights()
@@ -887,12 +887,12 @@ class ImageTransformerDenoiserModel(nn.Module):
         # zs = copy.copy(x)
         # temp for repa
         x_p = rearrange(x, 'b h w c -> b (h w) c')
-        zs = self.projector(x_p)
+        # zs = self.projector(x_p)
         # zs= None
 
         # segmentation
-        x_seg = self.seg_projector(x_p)
-        seg_pred = self.seg_decoder(rearrange(x_seg, 'b (h w) c -> b c h w', h=16, w=16))
+        # x_seg = self.seg_projector(x_p)
+        # seg_pred = self.seg_decoder(rearrange(x_seg, 'b (h w) c -> b c h w', h=16, w=16))
 
         for i, (up_level, split, skip, pos) in enumerate(reversed(list(zip(self.up_levels, self.splits, skips, poses)))):
             x = split(x, skip)
@@ -924,10 +924,10 @@ class ImageTransformerDenoiserModel(nn.Module):
         #     return x, zs
         # return x
         output = {'x': x}
-        if return_f:
-            output['zs'] = zs
-        if return_seg:
-            output['seg_pred'] = seg_pred
+        # if return_f:
+        #     output['zs'] = zs
+        # if return_seg:
+        #     output['seg_pred'] = seg_pred
 
         return output
 
