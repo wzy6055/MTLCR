@@ -26,7 +26,8 @@ from accelerate.utils import ProjectConfiguration, set_seed
 # from models.sitcr import SiT_models
 # from models.k_diffusion import image_transformer
 # from loss import SILoss, SICRLoss
-from engine import JiTEngine
+# from engine import JiTEngine
+from engine_xp_vl import JiTEngine
 from model import JiT_models
 # from utils import load_encoders
 
@@ -39,6 +40,7 @@ from torchvision.utils import make_grid
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision.transforms import Normalize
 
+USE_WANDB = True
 logger = get_logger(__name__)
 wandb.login(key="5762924b097784497ea7f44d7faff92bcb46d691")
 
@@ -81,6 +83,34 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
+def load_pretrained_weights(model, pretrain_path, logger, accelerator):
+    if accelerator.is_main_process:
+        logger.info(f"Loading pretrain weights from {pretrain_path}")
+
+    checkpoint = torch.load(pretrain_path, map_location='cpu')
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+
+    model_state_dict = model.state_dict()
+    cleaned_state_dict = OrderedDict()
+    skipped_mismatch_keys = []
+    for key, value in state_dict.items():
+        cleaned_key = key[4:] if key.startswith("net.") else key
+        if cleaned_key in model_state_dict and model_state_dict[cleaned_key].shape != value.shape:
+            skipped_mismatch_keys.append(
+                (cleaned_key, tuple(value.shape), tuple(model_state_dict[cleaned_key].shape))
+            )
+            continue
+        cleaned_state_dict[cleaned_key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(cleaned_state_dict, strict=False)
+    if accelerator.is_main_process:
+        if skipped_mismatch_keys:
+            logger.info(f"Skipped mismatched keys: {skipped_mismatch_keys}")
+        if missing_keys:
+            logger.info(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            logger.info(f"Unexpected keys: {unexpected_keys}")
+        logger.info("Pretrain weights loaded successfully")
 
 def load_config(args=None):
     with open(args.config, "r") as f:
@@ -112,6 +142,7 @@ def load_config(args=None):
 
 def main(args):
     config = load_config(args)
+    use_wandb = USE_WANDB
 
     # set accelerator
     logging_dir = Path(config.logging.output_dir, config.logging.logging_dir)
@@ -122,7 +153,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=config.optimization.gradient_accumulation_steps,
         mixed_precision=config.precision.mixed_precision,
-        log_with=config.logging.report_to,
+        log_with=config.logging.report_to if use_wandb else None,
         project_config=accelerator_project_config,
     )
 
@@ -133,27 +164,14 @@ def main(args):
         shutil.copyfile(args.config, os.path.join(save_dir, "config.yml"))
         checkpoint_dir = f"{save_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(save_dir)
-        logger.info(f"Experiment directory created at {save_dir}")
+        file_logger = create_logger(save_dir)
+        file_logger.info(f"Experiment directory created at {save_dir}")
     device = accelerator.device
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
     if config.misc.seed is not None:
         set_seed(config.misc.seed + accelerator.process_index)
 
-    # def namespace_to_dict(obj):
-    #     if isinstance(obj, dict):
-    #         return {k: namespace_to_dict(v) for k, v in obj.items()}
-    #     from types import SimpleNamespace
-    #     if isinstance(obj, SimpleNamespace):
-    #         return {k: namespace_to_dict(v) for k, v in vars(obj).items()}
-    #     if isinstance(obj, (list, tuple)):
-    #         return type(obj)(namespace_to_dict(v) for v in obj)
-    #     return obj
-    # kwargs = namespace_to_dict(config)
-    # model = image_transformer.ImageTransformerDenoiserModelInterface(**kwargs)
-    # model = DenoiserCR(**kwargs)
-    # model = DenoiserCR(config)
     model = JiT_models[config.model.model_name](
             input_size=config.dataset.resolution,
             in_channels=config.model.in_channels,
@@ -161,12 +179,16 @@ def main(args):
             attn_drop=config.model.attn_dropout,
             proj_drop=config.model.proj_dropout,
         )
+    # Load pretrain weights if specified
+    if hasattr(config, 'model') and hasattr(config.model, 'pretrain') and config.model.pretrain:
+        load_pretrained_weights(model, config.model.pretrain, logger, accelerator)
+
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
 
     if accelerator.is_main_process:
-        logger.info(f"JiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        file_logger.info(f"JiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     if config.precision.allow_tf32:
@@ -210,7 +232,7 @@ def main(args):
     )
 
     if accelerator.is_main_process:
-        logger.info(f"Dataset contains {len(train_dataset):,} images ({config.dataset.data_dir})")
+        file_logger.info(f"Dataset contains {len(train_dataset):,} images ({config.dataset.data_dir})")
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
@@ -254,7 +276,7 @@ def main(args):
         model, optimizer, train_dataloader, val_dataloader
     )
 
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and use_wandb:
         tracker_config = vars(copy.deepcopy(config))
         accelerator.init_trackers(
             project_name="JiTCR",
@@ -319,7 +341,7 @@ def main(args):
                     }
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    file_logger.info(f"Saved checkpoint to {checkpoint_path}")
 
             # val step
             if (global_step == 1 or (global_step % config.logging.sampling_steps == 0 and global_step > 0)):
@@ -328,14 +350,17 @@ def main(args):
                 for j, batch_val in enumerate(tqdm(val_dataloader, desc='Val')):
                     engine.test_step(batch_val)
                 metrics = engine.avg_metrics.value()
-                accelerator.log(metrics, step=global_step)
-                batch_log = {k: batch[k][:1] for k in batch}
-                image_results = engine.log_images(batch_log, sample=True)
-                accelerator.log({"input": wandb.Image(array2grid(image_results['input'])),
-                                 "cloudy": wandb.Image(array2grid(image_results['cloudy'])),
-                                 "samples": wandb.Image(array2grid(image_results['samples'])),
-                                 },
-                                step=global_step)
+                if use_wandb:
+                    accelerator.log(metrics, step=global_step)
+                    batch_log = {k: batch[k][:1] for k in batch}
+                    image_results = engine.log_images(batch_log, sample=True)
+                    accelerator.log({"input": wandb.Image(array2grid(image_results['input'])),
+                                     "cloudy": wandb.Image(array2grid(image_results['cloudy'])),
+                                     "samples": wandb.Image(array2grid(image_results['samples'])),
+                                     },
+                                    step=global_step)
+                elif accelerator.is_main_process:
+                    file_logger.info(f"Validation metrics at step {global_step}: {metrics}")
                 engine.model.train()
 
             logs = {
@@ -344,7 +369,8 @@ def main(args):
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
             }
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+            if use_wandb:
+                accelerator.log(logs, step=global_step)
 
             if global_step >= config.optimization.max_train_steps:
                 break
@@ -356,7 +382,7 @@ def main(args):
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        logger.info("Done!")
+        file_logger.info("Done!")
     accelerator.end_training()
 
 

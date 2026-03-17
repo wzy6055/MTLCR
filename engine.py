@@ -52,7 +52,7 @@ class JiTEngine:
         self.t_eps = config.sampling.t_eps
 
         self.avg_cknna = CKNNAAvgMeter()
-        self.avg_miou = mIoUAvgMeter(num_classes=6)
+        # self.avg_miou = mIoUAvgMeter(num_classes=6)
 
         assert self.method in ["heun", "euler"]
         assert self.prediction in ["e", "v", "x"]
@@ -89,17 +89,17 @@ class JiTEngine:
 
         # x-pred
         if self.prediction == "x":
-            x_pred, fs = self.model(z, t.flatten(), cond, return_f=True)
+            x_pred, fs = self.model(z, t.flatten(), cond)
             v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
             e_pred = (z - x_pred * t) / (1 - t).clamp_min(self.t_eps)
         # v-pred
         elif self.prediction == "v":
-            v_pred, fs = self.model(z, t.flatten(), cond, return_f=True)
+            v_pred, fs = self.model(z, t.flatten(), cond)
             x_pred = (1 - t) * v_pred + z
             e_pred = z - t * v_pred
         # e-pred
         elif self.prediction == "e":
-            e_pred, fs = self.model(z, t.flatten(), cond, return_f=True)
+            e_pred, fs = self.model(z, t.flatten(), cond)
             x_pred = (z - (1-t) * e_pred) / t.clamp_min(self.t_eps)
             v_pred = (z - e_pred) / t.clamp_min(self.t_eps)
 

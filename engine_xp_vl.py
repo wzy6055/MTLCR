@@ -16,8 +16,8 @@ class JiTEngine:
         self.model = model
         self.steps = config.sampling.num_sampling_steps
         self.method = config.sampling.sampling_method
-        self.prediction = config.sampling.model_prediction
-        self.loss = config.sampling.loss_prediction
+        self.prediction = config.sampling.prediction
+        self.loss = config.sampling.loss
         self.img_size = config.dataset.resolution
         self.avg_metrics = avg_img_metrics()
         self.P_mean = config.sampling.P_mean
