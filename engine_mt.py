@@ -127,9 +127,8 @@ class JiTEngine:
         v = x - e
         # e = (z - x * t) / (1 - t).clamp_min(self.t_eps)
 
-        z_encoded, pos, cond_encoded, control, skips, poses = self.model.encode(z, t.flatten(), cond)
-        z_bottleneck = self.model.bottleneck(z_encoded, pos, cond_encoded, control)
-        output = self.model.decode(z_bottleneck, skips, poses, cond_encoded, control)
+        output = self.model(z, t.flatten(), cond)
+
         # x-pred
         if self.prediction == "x":
             x_pred = output['x']

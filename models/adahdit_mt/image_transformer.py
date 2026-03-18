@@ -749,6 +749,10 @@ def build_mlp(hidden_size, projector_dim, z_dim):
                 nn.Linear(projector_dim, z_dim),
             )
 
+class IdentityAdaptor(nn.Module):
+    def forward(self, x, pos, cond, control, skips, poses):
+        return x, pos, cond, control, skips, poses
+
 class ImageTransformerDenoiserModel(nn.Module):
     def __init__(self, in_channels, out_channels, patch_size, levels, mapping, tanh=False, control_mode=None):
         super(ImageTransformerDenoiserModel, self).__init__()
@@ -795,6 +799,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
         # nn.init.zeros_(self.patch_out.proj.weight)
         self.tanh = nn.Tanh() if tanh else nn.Identity()
+        self.adaptor = IdentityAdaptor()
 
         # for repa
         # self.projector = build_mlp(1024, 2048, 1024)
@@ -909,8 +914,10 @@ class ImageTransformerDenoiserModel(nn.Module):
         x = x.movedim(-1, -3)
         return {'x': x}
 
-    def forward(self, x, timesteps, control=None):
+    def forward(self, x, timesteps, control=None, adaptor=None):
         x, pos, cond, control, skips, poses = self.encode(x, timesteps, control)
+        adaptor = self.adaptor if adaptor is None else adaptor
+        x, pos, cond, control, skips, poses = adaptor(x, pos, cond, control, skips, poses)
         x = self.bottleneck(x, pos, cond, control)
         result = self.decode(x, skips, poses, cond, control)
         return result
