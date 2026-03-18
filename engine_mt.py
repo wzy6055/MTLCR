@@ -127,21 +127,21 @@ class JiTEngine:
         v = x - e
         # e = (z - x * t) / (1 - t).clamp_min(self.t_eps)
 
+        z_encoded, pos, cond_encoded, control, skips, poses = self.model.encode(z, t.flatten(), cond)
+        z_bottleneck = self.model.bottleneck(z_encoded, pos, cond_encoded, control)
+        output = self.model.decode(z_bottleneck, skips, poses, cond_encoded, control)
         # x-pred
         if self.prediction == "x":
-            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
             x_pred = output['x']
             v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
             e_pred = (z - x_pred * t) / (1 - t).clamp_min(self.t_eps)
         # v-pred
         elif self.prediction == "v":
-            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
             v_pred = output['x']
             x_pred = (1 - t) * v_pred + z
             e_pred = z - t * v_pred
         # e-pred
         elif self.prediction == "e":
-            output = self.model(z, t.flatten(), cond, return_f=False, return_seg=False)
             e_pred = output['x']
             x_pred = (z - (1-t) * e_pred) / t.clamp_min(self.t_eps)
             v_pred = (z - e_pred) / t.clamp_min(self.t_eps)
@@ -167,7 +167,7 @@ class JiTEngine:
         device = cond.device
         bsz = cond.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        output = self.sample(cond, z, bsz=bsz, device=device, return_f=False, return_seg=False)
+        output = self.sample(cond, z, bsz=bsz, device=device)
         samples = output['z_next']
         for i in range(samples.shape[0]):
             _target = x[i, ...]
@@ -180,7 +180,7 @@ class JiTEngine:
         return self.avg_metrics
 
     @torch.no_grad()
-    def sample(self, cond, z, bsz, device, return_f=False, return_seg=False):
+    def sample(self, cond, z, bsz, device):
         timesteps = torch.linspace(0.0, 1.0, self.steps + 1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
         output = {'z_next': z}
         if self.method == "euler":
@@ -192,49 +192,48 @@ class JiTEngine:
         for i in range(self.steps - 1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
-            output = stepper(output['z_next'], t, t_next, cond, return_f, return_seg)
+            output = stepper(output['z_next'], t, t_next, cond)
         # last step euler
-        output = self._euler_step(output['z_next'], timesteps[-2], timesteps[-1], cond, return_f, return_seg)
+        output = self._euler_step(output['z_next'], timesteps[-2], timesteps[-1], cond)
         return output
 
     @torch.no_grad()
-    def _forward_sample(self, z, t, cond, return_f=False, return_seg=False):
+    def _forward_sample(self, z, t, cond):
         if self.prediction == "x":
-            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
+            output = self.model(z, t.flatten(), cond)
             x_cond = output['x']
             v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
             output['v_cond'] = v_cond
-        # TODO: update v-pred and e-pred
         elif self.prediction == "v":
-            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
+            output = self.model(z, t.flatten(), cond)
             output['v_cond'] = output['x']
         elif self.prediction == "e":
-            output = self.model(z, t.flatten(), cond, return_f=return_f, return_seg=return_seg)
+            output = self.model(z, t.flatten(), cond)
             e_cond = output['x']
             output['v_cond'] = (z - e_cond) / t.clamp_min(self.t_eps)
         return output
 
     @torch.no_grad()
-    def _euler_step(self, z, t, t_next, cond, return_f=False, return_seg=False):
-        output = self._forward_sample(z, t, cond, return_f, return_seg)
+    def _euler_step(self, z, t, t_next, cond):
+        output = self._forward_sample(z, t, cond)
         v_pred = output['v_cond']
         z_next = z + (t_next - t) * v_pred
         output['z_next'] = z_next
         return output
 
     @torch.no_grad()
-    def _heun_step(self, z, t, t_next, cond, return_f=False, return_seg=False):
-        output_t = self._forward_sample(z, t, cond, return_f, return_seg)
+    def _heun_step(self, z, t, t_next, cond):
+        output_t = self._forward_sample(z, t, cond)
         v_pred_t = output_t['v_cond']
 
         z_next_euler = z + (t_next - t) * v_pred_t
-        output_t_next = self._forward_sample(z_next_euler, t_next, cond, return_f, return_seg)
+        output_t_next = self._forward_sample(z_next_euler, t_next, cond)
         v_pred_t_next = output_t_next['v_cond']
 
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
         z_next = z + (t_next - t) * v_pred
 
-        output = output_t_next if (return_f or return_seg) else {}
+        output = {}
         output['v_cond'] = v_pred
         output['z_next'] = z_next
         return output
@@ -251,7 +250,7 @@ class JiTEngine:
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
 
         if sample:
-            output = self.sample(cond, z, bsz=bsz, device=device, return_f=False, return_seg=False)
+            output = self.sample(cond, z, bsz=bsz, device=device)
             samples = output['z_next']
             results["samples"] = self.scale_01(samples)
 

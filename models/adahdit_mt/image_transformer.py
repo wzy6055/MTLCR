@@ -850,7 +850,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         c = None
         return x, c
 
-    def forward(self, x, timesteps, control=None, return_f=False, return_seg=False):
+    def encode(self, x, timesteps, control=None):
         x, control = self.process_input(x, control)
         x = x.movedim(-3, -1)
         x = self.patch_in(x)
@@ -860,7 +860,6 @@ class ImageTransformerDenoiserModel(nn.Module):
         time_emb = self.time_in_proj(self.time_emb(c_noise[..., None]))
         cond = self.mapping(time_emb)
 
-        # Hourglass transformer
         skips, poses = [], []
         for down_level, merge in zip(self.down_levels, self.merges):
             x = down_level(x, pos, cond)
@@ -868,13 +867,15 @@ class ImageTransformerDenoiserModel(nn.Module):
             poses.append(pos)
             x = merge(x)
             pos = downscale_pos(pos)
+        return x, pos, cond, control, skips, poses
 
+    def bottleneck(self, x, pos, cond, control=None):
         if self.control_mode == "sum":
             index = len(control) - 1
             x = x + control[index]
         elif self.control_mode == "conv":
             index = len(control) - 1
-            x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)        
+            x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
         elif self.control_mode == "lerp":
             index = len(control) - 1
             x = self.control_lerps[index](x, control[index])
@@ -882,18 +883,9 @@ class ImageTransformerDenoiserModel(nn.Module):
             pass
         else:
             raise NotImplementedError(f"control mode `{self.control_mode}` is not implemented!")
-        x = self.mid_level(x, pos, cond)
+        return self.mid_level(x, pos, cond)
 
-        # zs = copy.copy(x)
-        # temp for repa
-        x_p = rearrange(x, 'b h w c -> b (h w) c')
-        # zs = self.projector(x_p)
-        # zs= None
-
-        # segmentation
-        # x_seg = self.seg_projector(x_p)
-        # seg_pred = self.seg_decoder(rearrange(x_seg, 'b (h w) c -> b c h w', h=16, w=16))
-
+    def decode(self, x, skips, poses, cond, control=None):
         for i, (up_level, split, skip, pos) in enumerate(reversed(list(zip(self.up_levels, self.splits, skips, poses)))):
             x = split(x, skip)
             if self.control_mode == "sum":
@@ -901,35 +893,27 @@ class ImageTransformerDenoiserModel(nn.Module):
                 x = x + control[index]
             elif self.control_mode == "conv":
                 index = len(control) - i - 2
-                x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)              
+                x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
             elif self.control_mode == "lerp":
                 index = len(control) - i - 2
-                x = self.control_lerps[index](x, control[index])   
+                x = self.control_lerps[index](x, control[index])
             elif self.control_mode is None:
                 pass
             else:
                 raise NotImplementedError(f"control mode `{self.control_mode}` is not implemented!")
             x = up_level(x, pos, cond)
 
-        # Unpatching
         x = self.out_norm(x)
         x = self.patch_out(x)
         x = self.tanh(x)
         x = x.movedim(-1, -3)
+        return {'x': x}
 
-        # zs = None
-        # return x, zs
-
-        # if return_f:
-        #     return x, zs
-        # return x
-        output = {'x': x}
-        # if return_f:
-        #     output['zs'] = zs
-        # if return_seg:
-        #     output['seg_pred'] = seg_pred
-
-        return output
+    def forward(self, x, timesteps, control=None):
+        x, pos, cond, control, skips, poses = self.encode(x, timesteps, control)
+        x = self.bottleneck(x, pos, cond, control)
+        result = self.decode(x, skips, poses, cond, control)
+        return result
 
 class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
     def __init__(
