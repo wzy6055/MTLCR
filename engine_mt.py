@@ -166,8 +166,14 @@ class JiTEngine:
         device = cond.device
         bsz = cond.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        output = self.sample(cond, z, bsz=bsz, device=device)
-        samples = output['z_next']
+        sample_state = {
+            'cond': cond,
+            'z_next': z,
+            'bsz': bsz,
+            'device': device,
+        }
+        sample_state = self.sample(sample_state)
+        samples = sample_state['z_next']
         for i in range(samples.shape[0]):
             _target = x[i, ...]
             _samples = samples[i, ...]
@@ -179,9 +185,13 @@ class JiTEngine:
         return self.avg_metrics
 
     @torch.no_grad()
-    def sample(self, cond, z, bsz, device):
+    def sample(self, state):
+        cond = state['cond']
+        z = state['z_next']
+        bsz = state['bsz']
+        device = state['device']
         timesteps = torch.linspace(0.0, 1.0, self.steps + 1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
-        output = {'z_next': z}
+        output = dict(state)
         if self.method == "euler":
             stepper = self._euler_step
         elif self.method == "heun":
@@ -189,15 +199,20 @@ class JiTEngine:
         else:
             raise NotImplementedError
         for i in range(self.steps - 1):
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
-            output = stepper(output['z_next'], t, t_next, cond)
+            output['t'] = timesteps[i]
+            output['t_next'] = timesteps[i + 1]
+            output = stepper(output)
         # last step euler
-        output = self._euler_step(output['z_next'], timesteps[-2], timesteps[-1], cond)
+        output['t'] = timesteps[-2]
+        output['t_next'] = timesteps[-1]
+        output = self._euler_step(output)
         return output
 
     @torch.no_grad()
-    def _forward_sample(self, z, t, cond):
+    def _forward_sample(self, state):
+        z = state['z_next']
+        t = state['t']
+        cond = state['cond']
         if self.prediction == "x":
             output = self.model(z, t.flatten(), cond)
             x_cond = output['x']
@@ -210,31 +225,39 @@ class JiTEngine:
             output = self.model(z, t.flatten(), cond)
             e_cond = output['x']
             output['v_cond'] = (z - e_cond) / t.clamp_min(self.t_eps)
-        return output
+        merged_state = dict(state)
+        merged_state.update(output)
+        return merged_state
 
     @torch.no_grad()
-    def _euler_step(self, z, t, t_next, cond):
-        output = self._forward_sample(z, t, cond)
+    def _euler_step(self, state):
+        output = self._forward_sample(state)
+        z = output['z_next']
+        t = output['t']
+        t_next = output['t_next']
         v_pred = output['v_cond']
-        z_next = z + (t_next - t) * v_pred
-        output['z_next'] = z_next
+        output['z_next'] = z + (t_next - t) * v_pred
         return output
 
     @torch.no_grad()
-    def _heun_step(self, z, t, t_next, cond):
-        output_t = self._forward_sample(z, t, cond)
+    def _heun_step(self, state):
+        output_t = self._forward_sample(state)
         v_pred_t = output_t['v_cond']
+        z = output_t['z_next']
+        t = output_t['t']
+        t_next = output_t['t_next']
 
         z_next_euler = z + (t_next - t) * v_pred_t
-        output_t_next = self._forward_sample(z_next_euler, t_next, cond)
+        next_state = dict(output_t)
+        next_state['z_next'] = z_next_euler
+        next_state['t'] = t_next
+        output_t_next = self._forward_sample(next_state)
         v_pred_t_next = output_t_next['v_cond']
 
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
-        z_next = z + (t_next - t) * v_pred
-
-        output = {}
+        output = dict(output_t_next)
         output['v_cond'] = v_pred
-        output['z_next'] = z_next
+        output['z_next'] = z + (t_next - t) * v_pred
         return output
 
     @torch.no_grad()
@@ -249,8 +272,14 @@ class JiTEngine:
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
 
         if sample:
-            output = self.sample(cond, z, bsz=bsz, device=device)
-            samples = output['z_next']
+            sample_state = {
+                'cond': cond,
+                'z_next': z,
+                'bsz': bsz,
+                'device': device,
+            }
+            sample_state = self.sample(sample_state)
+            samples = sample_state['z_next']
             results["samples"] = self.scale_01(samples)
 
         return results
