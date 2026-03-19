@@ -1,0 +1,70 @@
+logging:
+  output_dir: "exps"
+  exp_name: "vaihingen_thick_adahdit_dinojoint_B2_100k"
+  logging_dir: "logs"
+  report_to: "wandb"
+  sampling_steps: 1000
+  resume_step: 0
+
+model:
+  in_channels:  6
+  out_channels: 3
+  patch_size: [2,2]
+  widths: [128,256,512,1024]
+  depths: [2,2,2,2]
+  d_ffs: [256,512,1024,2048]
+  self_attns: [
+    {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+    {"type": "neighborhood", "d_head": 64, "kernel_size": 7},
+    {"type": "global", "d_head": 64},
+    {"type": "global", "d_head": 64},
+  ]
+  dropout_rate: [0.0,0.0,0.0,0.1]
+  mapping_depth: 2
+  mapping_width: 1024
+  mapping_d_ff: 2048
+  mapping_dropout_rate: 0.1
+  adaptor:
+    type: "dino_joint"
+    latent_dim: 1024
+    branch_depth: 2
+    dropout: 0.1
+    latent_key: "cloudy_latent"
+
+sampling:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+  sampling_method: "heun" # [heun, euler]
+  num_sampling_steps: 4
+  prediction: "x"
+  loss: "v"
+
+dataset:
+  data_dir: "/224010098/DATASET/DACR/Vaihingen/"
+  cloud_type: 'thick'
+  latent_dir: "./fm_feature/Vaihingen/dinov3_vitl16_sat493m"
+  resolution: 256
+  batch_size: 4
+  val_size: 100
+
+precision:
+  allow_tf32: true
+  mixed_precision: "fp16"   # choices: ["no", "fp16", "bf16"]
+
+optimization:
+  epochs: 1400
+  max_train_steps: 100000
+  checkpointing_steps: 10000
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-08
+  max_grad_norm: 1.0
+
+misc:
+  seed: 0
+  num_workers: 4
