@@ -2,7 +2,7 @@ output_dir/
 dataset_dino_v3/
 wandb/
 src/
-.idea
+.idea/
 prompt.txt
 skills/
 /fm_feature/

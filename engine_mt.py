@@ -116,6 +116,19 @@ class JiTEngine:
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
+    def _build_model_control(self, image, batch_or_state=None):
+        control = {"image": image}
+        if batch_or_state is None:
+            return control
+
+        if isinstance(batch_or_state, dict):
+            latent = batch_or_state.get("cloudy_latent")
+            if latent is None:
+                latent = batch_or_state.get("dino_latent")
+            if latent is not None:
+                control["cloudy_latent"] = latent
+        return control
+
     def __call__(self, batch):
         x, cond = batch['clear'].clone(), batch['cloudy'].clone()
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -127,7 +140,8 @@ class JiTEngine:
         v = x - e
         # e = (z - x * t) / (1 - t).clamp_min(self.t_eps)
 
-        output = self.model(z, t.flatten(), cond)
+        model_control = self._build_model_control(cond, batch)
+        output = self.model(z, t.flatten(), model_control)
 
         # x-pred
         if self.prediction == "x":
@@ -167,7 +181,7 @@ class JiTEngine:
         bsz = cond.size(0)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
         sample_state = {
-            'cond': cond,
+            'control': self._build_model_control(cond, batch),
             'z_next': z,
             'bsz': bsz,
             'device': device,
@@ -186,7 +200,7 @@ class JiTEngine:
 
     @torch.no_grad()
     def sample(self, state):
-        cond = state['cond']
+        control = state['control']
         z = state['z_next']
         bsz = state['bsz']
         device = state['device']
@@ -212,17 +226,17 @@ class JiTEngine:
     def _forward_sample(self, state):
         z = state['z_next']
         t = state['t']
-        cond = state['cond']
+        control = state['control']
         if self.prediction == "x":
-            output = self.model(z, t.flatten(), cond)
+            output = self.model(z, t.flatten(), control)
             x_cond = output['x']
             v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
             output['v_cond'] = v_cond
         elif self.prediction == "v":
-            output = self.model(z, t.flatten(), cond)
+            output = self.model(z, t.flatten(), control)
             output['v_cond'] = output['x']
         elif self.prediction == "e":
-            output = self.model(z, t.flatten(), cond)
+            output = self.model(z, t.flatten(), control)
             e_cond = output['x']
             output['v_cond'] = (z - e_cond) / t.clamp_min(self.t_eps)
         merged_state = dict(state)
@@ -273,7 +287,7 @@ class JiTEngine:
 
         if sample:
             sample_state = {
-                'cond': cond,
+                'control': self._build_model_control(cond, batch),
                 'z_next': z,
                 'bsz': bsz,
                 'device': device,

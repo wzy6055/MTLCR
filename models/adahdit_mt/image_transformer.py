@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from functools import lru_cache, reduce
 import math
-from typing import Union
+from typing import Optional, Union
 import copy
 
 from einops import rearrange
@@ -750,14 +750,176 @@ def build_mlp(hidden_size, projector_dim, z_dim):
             )
 
 class IdentityAdaptor(nn.Module):
-    def forward(self, x, pos, cond, control, skips, poses):
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        return x, pos, cond, control, skips, poses
+
+
+class JointAttentionBlock(nn.Module):
+    def __init__(self, d_model, d_head, cond_features, dropout=0.0):
+        super().__init__()
+        self.d_head = d_head
+        self.n_heads = d_model // d_head
+        self.query_norm = RMSNorm(d_model)
+        self.source_norm = RMSNorm(d_model)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            apply_wd(zero_init(Linear(cond_features, 3 * d_model, bias=True)))
+        )
+        tag_module(self.adaLN_modulation, "mapping")
+
+        self.q_proj = apply_wd(Linear(d_model, d_model, bias=False))
+        self.k_proj = apply_wd(Linear(d_model, d_model, bias=False))
+        self.v_proj = apply_wd(Linear(d_model, d_model, bias=False))
+        self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
+        self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
+
+    def forward(self, x, source, pos, cond):
+        skip = x
+        shift, scale, gate = self.adaLN_modulation(cond).chunk(3, dim=-1)
+
+        x = self.query_norm(x)
+        x = modulate(x, shift, scale)
+        source = self.source_norm(source)
+        source = modulate(source, shift, scale)
+
+        q = self.q_proj(x)
+        k_self = self.k_proj(x)
+        v_self = self.v_proj(x)
+        k_source = self.k_proj(source)
+        v_source = self.v_proj(source)
+
+        pos = rearrange(pos, "... h w e -> ... (h w) e").to(q.dtype)
+        theta = self.pos_emb(pos).movedim(-2, -3)
+
+        q = rearrange(q, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+        k_self = rearrange(k_self, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+        v_self = rearrange(v_self, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+        k_source = rearrange(k_source, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+        v_source = rearrange(v_source, "n h w (nh e) -> n nh (h w) e", e=self.d_head)
+
+        q_raw = q
+        q, k_self = scale_for_cosine_sim(q_raw, k_self, self.scale[:, None, None], 1e-6)
+        _, k_source = scale_for_cosine_sim(q_raw, k_source, self.scale[:, None, None], 1e-6)
+        q = apply_rotary_emb_(q, theta)
+        k_self = apply_rotary_emb_(k_self, theta)
+        k_source = apply_rotary_emb_(k_source, theta)
+
+        k = torch.cat([k_self, k_source], dim=-2)
+        v = torch.cat([v_self, v_source], dim=-2)
+        x = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+        x = rearrange(x, "n nh (h w) e -> n h w (nh e)", h=skip.shape[-3], w=skip.shape[-2])
+        x = self.dropout(x)
+        x = self.out_proj(x)
+
+        gate = broadcast_1d_to(skip, gate)
+        return skip + gate * x
+
+
+class DinoJointAdaptor(nn.Module):
+    def __init__(
+        self,
+        model_width,
+        cond_features,
+        d_ff,
+        d_head,
+        latent_dim=1024,
+        branch_depth=2,
+        dropout=0.0,
+        latent_key="cloudy_latent",
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_key = latent_key
+        self.latent_norm = nn.LayerNorm(latent_dim)
+        self.latent_proj = apply_wd(Linear(latent_dim, model_width, bias=False))
+        self.pre_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.branch_blocks = Level(
+            [GlobalTransformerLayer(model_width, d_ff, d_head, cond_features, dropout=dropout) for _ in range(branch_depth)]
+        )
+        self.post_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+
+    def _normalize_control(self, control):
+        if isinstance(control, dict):
+            return dict(control)
+        if control is None:
+            return {}
+        return {"image": control}
+
+    def _prepare_latent(self, latent, pos, dtype, device):
+        if latent is None:
+            return None
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        elif latent.dim() == 4:
+            if latent.shape[-1] == self.latent_dim:
+                pass
+            elif latent.shape[1] == self.latent_dim:
+                latent = latent.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
+            if latent.shape[-3:-1] != pos.shape[:2]:
+                latent = latent.permute(0, 3, 1, 2)
+                latent = F.interpolate(latent, size=tuple(pos.shape[:2]), mode="bilinear", align_corners=False)
+                latent = latent.permute(0, 2, 3, 1)
+            latent = self.latent_norm(latent)
+            return self.latent_proj(latent)
+
+        if latent.dim() != 3:
+            raise ValueError(f"Unsupported latent rank: {latent.dim()}")
+
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dim {self.latent_dim}, got {latent.shape[-1]} for latent shape {tuple(latent.shape)}"
+            )
+
+        latent = self.latent_norm(latent)
+        latent = self.latent_proj(latent)
+        bsz, num_tokens, channels = latent.shape
+        target_h, target_w = pos.shape[:2]
+        if num_tokens == target_h * target_w:
+            latent = latent.view(bsz, target_h, target_w, channels)
+            return latent
+
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"Latent token count {num_tokens} cannot be reshaped into a square grid")
+
+        latent = latent.view(bsz, side, side, channels).permute(0, 3, 1, 2)
+        latent = F.interpolate(latent, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return latent.permute(0, 2, 3, 1)
+
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        control = self._normalize_control(control)
+        if stage == "pre_bottleneck":
+            dino_latent = self._prepare_latent(control.get(self.latent_key), pos, x.dtype, x.device)
+            if dino_latent is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.pre_joint(x, dino_latent, pos, cond)
+            dino_branch = self.branch_blocks(dino_latent, pos, cond)
+            control["dino_branch"] = dino_branch
+            return x, pos, cond, control, skips, poses
+
+        if stage == "post_bottleneck":
+            dino_branch = control.get("dino_branch")
+            if dino_branch is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.post_joint(x, dino_branch.to(dtype=x.dtype, device=x.device), pos, cond)
+            control["dino_branch"] = dino_branch
+
         return x, pos, cond, control, skips, poses
 
 class ImageTransformerDenoiserModel(nn.Module):
-    def __init__(self, in_channels, out_channels, patch_size, levels, mapping, tanh=False, control_mode=None):
+    def __init__(self, in_channels, out_channels, patch_size, levels, mapping, tanh=False, control_mode=None, adaptor=None):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
         self.control_mode = control_mode
+        self.levels = levels
         self.patch_in = TokenMerge(in_channels, levels[0].width, patch_size)
 
         self.time_emb = layers.FourierFeatures(1, mapping.width)
@@ -799,7 +961,7 @@ class ImageTransformerDenoiserModel(nn.Module):
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
         # nn.init.zeros_(self.patch_out.proj.weight)
         self.tanh = nn.Tanh() if tanh else nn.Identity()
-        self.adaptor = IdentityAdaptor()
+        self.adaptors = self._build_adaptors(adaptor, mapping.width, levels)
 
         # for repa
         # self.projector = build_mlp(1024, 2048, 1024)
@@ -837,6 +999,50 @@ class ImageTransformerDenoiserModel(nn.Module):
         for level in self.up_levels:
             zero_init_level(level)
 
+    def _build_single_adaptor(self, adaptor_cfg, cond_width, levels):
+        adaptor_type = adaptor_cfg.get("type", "identity")
+        if adaptor_type == "identity":
+            return IdentityAdaptor()
+        if adaptor_type != "dino_joint":
+            raise ValueError(f"Unsupported adaptor type: {adaptor_type}")
+
+        bottleneck_spec = levels[-1]
+        bottleneck_attn = bottleneck_spec.self_attn
+        d_head = getattr(bottleneck_attn, "d_head", bottleneck_spec.width)
+        return DinoJointAdaptor(
+            model_width=bottleneck_spec.width,
+            cond_features=cond_width,
+            d_ff=bottleneck_spec.d_ff,
+            d_head=d_head,
+            latent_dim=adaptor_cfg.get("latent_dim", 1024),
+            branch_depth=adaptor_cfg.get("branch_depth", 2),
+            dropout=adaptor_cfg.get("dropout", bottleneck_spec.dropout),
+            latent_key=adaptor_cfg.get("latent_key", "cloudy_latent"),
+        )
+
+    def _build_adaptors(self, adaptor_cfg, cond_width, levels):
+        if adaptor_cfg is None:
+            adaptor_cfgs = [{"type": "identity"}]
+        elif isinstance(adaptor_cfg, list):
+            adaptor_cfgs = adaptor_cfg
+        else:
+            adaptor_cfgs = [adaptor_cfg]
+        return nn.ModuleList([self._build_single_adaptor(cfg, cond_width, levels) for cfg in adaptor_cfgs])
+
+    def _run_adaptors(self, stage, x, pos, cond, control, skips, poses, adaptor=None):
+        if adaptor is None:
+            adaptors = self.adaptors
+        elif isinstance(adaptor, nn.ModuleList):
+            adaptors = adaptor
+        elif isinstance(adaptor, (list, tuple)):
+            adaptors = adaptor
+        else:
+            adaptors = [adaptor]
+
+        for module in adaptors:
+            x, pos, cond, control, skips, poses = module(stage, x, pos, cond, control, skips, poses)
+        return x, pos, cond, control, skips, poses
+
     def param_groups(self, base_lr=5e-4, mapping_lr_scale=1 / 3):
         wd = filter_params(lambda tags: "wd" in tags and "mapping" not in tags, self)
         no_wd = filter_params(lambda tags: "wd" not in tags and "mapping" not in tags, self)
@@ -851,9 +1057,15 @@ class ImageTransformerDenoiserModel(nn.Module):
         return groups
 
     def process_input(self, x, c):
-        x = torch.cat((x, c), dim=1)
-        c = None
+        image = c.get("image") if isinstance(c, dict) else c
+        if image is not None:
+            x = torch.cat((x, image), dim=1)
         return x, c
+
+    def _get_control_features(self, control):
+        if isinstance(control, dict):
+            return control.get("control")
+        return control
 
     def encode(self, x, timesteps, control=None):
         x, control = self.process_input(x, control)
@@ -875,15 +1087,16 @@ class ImageTransformerDenoiserModel(nn.Module):
         return x, pos, cond, control, skips, poses
 
     def bottleneck(self, x, pos, cond, control=None):
+        control_features = self._get_control_features(control)
         if self.control_mode == "sum":
-            index = len(control) - 1
-            x = x + control[index]
+            index = len(control_features) - 1
+            x = x + control_features[index]
         elif self.control_mode == "conv":
-            index = len(control) - 1
-            x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
+            index = len(control_features) - 1
+            x = self.control_convs[index](torch.cat([x, control_features[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
         elif self.control_mode == "lerp":
-            index = len(control) - 1
-            x = self.control_lerps[index](x, control[index])
+            index = len(control_features) - 1
+            x = self.control_lerps[index](x, control_features[index])
         elif self.control_mode is None:
             pass
         else:
@@ -891,17 +1104,18 @@ class ImageTransformerDenoiserModel(nn.Module):
         return self.mid_level(x, pos, cond)
 
     def decode(self, x, skips, poses, cond, control=None):
+        control_features = self._get_control_features(control)
         for i, (up_level, split, skip, pos) in enumerate(reversed(list(zip(self.up_levels, self.splits, skips, poses)))):
             x = split(x, skip)
             if self.control_mode == "sum":
-                index = len(control) - i - 2
-                x = x + control[index]
+                index = len(control_features) - i - 2
+                x = x + control_features[index]
             elif self.control_mode == "conv":
-                index = len(control) - i - 2
-                x = self.control_convs[index](torch.cat([x, control[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
+                index = len(control_features) - i - 2
+                x = self.control_convs[index](torch.cat([x, control_features[index]], dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
             elif self.control_mode == "lerp":
-                index = len(control) - i - 2
-                x = self.control_lerps[index](x, control[index])
+                index = len(control_features) - i - 2
+                x = self.control_lerps[index](x, control_features[index])
             elif self.control_mode is None:
                 pass
             else:
@@ -916,9 +1130,13 @@ class ImageTransformerDenoiserModel(nn.Module):
 
     def forward(self, x, timesteps, control=None, adaptor=None):
         x, pos, cond, control, skips, poses = self.encode(x, timesteps, control)
-        adaptor = self.adaptor if adaptor is None else adaptor
-        x, pos, cond, control, skips, poses = adaptor(x, pos, cond, control, skips, poses)
+        x, pos, cond, control, skips, poses = self._run_adaptors(
+            "pre_bottleneck", x, pos, cond, control, skips, poses, adaptor=adaptor
+        )
         x = self.bottleneck(x, pos, cond, control)
+        x, pos, cond, control, skips, poses = self._run_adaptors(
+            "post_bottleneck", x, pos, cond, control, skips, poses, adaptor=adaptor
+        )
         result = self.decode(x, skips, poses, cond, control)
         return result
 
@@ -943,7 +1161,8 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         mapping_d_ff=512,
         mapping_dropout_rate=0.0,
         tanh=False,
-        control_mode=None
+        control_mode=None,
+        adaptor: Optional[dict] = None
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -964,7 +1183,7 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
                     raise ValueError(f'unsupported self attention type {self_attn["type"]}')
                 levels.append(LevelSpec(depth, width, d_ff, self_attn, dropout))
         mapping = MappingSpec(mapping_depth, mapping_width, mapping_d_ff, mapping_dropout_rate)
-        super().__init__(in_channels, out_channels, patch_size, levels, mapping, tanh, control_mode)
+        super().__init__(in_channels, out_channels, patch_size, levels, mapping, tanh, control_mode, adaptor)
 
 if __name__ == '__main__':
     # import flags, layers
