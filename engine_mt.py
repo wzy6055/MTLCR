@@ -103,11 +103,32 @@ class JiTEngine:
         self.noise_scale = config.sampling.noise_scale
         self.t_eps = config.sampling.t_eps
 
-        self.avg_miou = mIoUAvgMeter(num_classes=6)
+        model_seg_cfg = getattr(config.model, "segmentation", None)
+        train_seg_cfg = getattr(config, "segmentation", None)
+        self.seg_enabled = bool(
+            (train_seg_cfg is not None and getattr(train_seg_cfg, "enabled", False))
+            or (model_seg_cfg is not None and getattr(model_seg_cfg, "enabled", False))
+        )
+        self.seg_num_classes = self._get_cfg_value(train_seg_cfg, "num_classes", None)
+        if self.seg_num_classes is None:
+            self.seg_num_classes = self._get_cfg_value(model_seg_cfg, "num_classes", 6)
+        self.seg_ignore_index = self._get_cfg_value(train_seg_cfg, "ignore_index", 255)
+        self.seg_loss_weight = self._get_cfg_value(train_seg_cfg, "loss_weight", 1.0)
+        self.seg_eval_t = self._get_cfg_value(train_seg_cfg, "eval_t", 1.0)
+        self.seg_criterion = CrossEntropy2d_ignore(ignore_label=self.seg_ignore_index) if self.seg_enabled else None
+        self.avg_miou = (
+            mIoUAvgMeter(num_classes=self.seg_num_classes, ignore_index=self.seg_ignore_index)
+            if self.seg_enabled else None
+        )
 
         assert self.method in ["heun", "euler"]
         assert self.prediction in ["e", "v", "x"]
         assert self.loss in ["e", "v", "x"]
+
+    def _get_cfg_value(self, cfg, key, default=None):
+        if cfg is None:
+            return default
+        return getattr(cfg, key, default)
 
     def scale_01(self, batch_image):
         return (batch_image + 1.0) / 2.0
@@ -172,7 +193,42 @@ class JiTEngine:
         # loss = loss.mean(dim=(1, 2, 3)).mean()
         denoising_loss = mean_flat(loss)
 
-        return denoising_loss
+        if not self.seg_enabled:
+            return denoising_loss
+
+        if 'mask' not in batch:
+            raise KeyError("Segmentation is enabled, but batch does not contain `mask`.")
+
+        seg_logits = output.get('seg_logits')
+        if seg_logits is None:
+            raise KeyError("Segmentation is enabled, but model output does not contain `seg_logits`.")
+
+        seg_target = batch['mask'].long().to(seg_logits.device)
+        seg_loss = self.seg_criterion(seg_logits, seg_target)
+        total_loss = denoising_loss.mean() + self.seg_loss_weight * seg_loss
+
+        return {
+            'loss': total_loss,
+            'denoising_loss': denoising_loss,
+            'seg_loss': seg_loss,
+        }
+
+    @torch.no_grad()
+    def predict_segmentation(self, batch):
+        if not self.seg_enabled:
+            return None
+
+        cond = batch['cloudy'].clone()
+        seg_input = torch.zeros_like(cond)
+        timesteps = torch.full(
+            (cond.size(0),),
+            fill_value=self.seg_eval_t,
+            device=cond.device,
+            dtype=torch.float32,
+        )
+        model_control = self._build_model_control(cond, batch)
+        output = self.model(seg_input, timesteps, model_control)
+        return output.get('seg_logits')
 
     @torch.no_grad()
     def test_step(self, batch):
@@ -195,6 +251,11 @@ class JiTEngine:
             _samples = self.scale_01(_samples)
             metrics = img_metrics(target=_target.unsqueeze(0), pred=_samples.unsqueeze(0))
             self.avg_metrics.add(metrics)
+
+        if self.seg_enabled and self.avg_miou is not None and 'mask' in batch:
+            seg_logits = self.predict_segmentation(batch)
+            if seg_logits is not None:
+                self.avg_miou.update(seg_logits.detach(), batch['mask'].to(seg_logits.device))
 
         return self.avg_metrics
 
@@ -295,5 +356,12 @@ class JiTEngine:
             sample_state = self.sample(sample_state)
             samples = sample_state['z_next']
             results["samples"] = self.scale_01(samples)
+
+        if self.seg_enabled:
+            seg_logits = self.predict_segmentation(batch)
+            if seg_logits is not None:
+                results["mask_pred"] = seg_logits.argmax(dim=1, keepdim=True)
+            if 'mask' in batch:
+                results["mask_label"] = batch['mask'].unsqueeze(1)
 
         return results

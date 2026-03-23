@@ -21,6 +21,7 @@ from engine_mt import JiTEngine
 from models.adahdit_mt import image_transformer
 
 from dataset import CUHKCRDataset, ISPRSDataset
+from data.ISPRS_dataset import convert_to_color
 import wandb
 import math
 from torchvision.utils import make_grid
@@ -235,8 +236,15 @@ def main(args):
         engine.model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(engine.model):
-                loss = engine(batch)
-                loss_mean = loss.mean()
+                loss_output = engine(batch)
+                if isinstance(loss_output, dict):
+                    denoising_loss_mean = loss_output["denoising_loss"].mean()
+                    seg_loss_mean = loss_output["seg_loss"]
+                    loss_mean = loss_output["loss"]
+                else:
+                    denoising_loss_mean = loss_output.mean()
+                    seg_loss_mean = None
+                    loss_mean = denoising_loss_mean
 
                 accelerator.backward(loss_mean)
                 if accelerator.sync_gradients:
@@ -253,9 +261,10 @@ def main(args):
                 global_step += 1
 
             if global_step % config.optimization.checkpointing_steps == 0 or global_step == 1:
+                accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "model": engine.model.state_dict(),
+                        "model": accelerator.unwrap_model(engine.model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
                         "config": config,
@@ -264,30 +273,46 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     file_logger.info(f"Saved checkpoint to {checkpoint_path}")
+                accelerator.wait_for_everyone()
 
             if global_step == 1 or (global_step % config.logging.sampling_steps == 0 and global_step > 0):
                 engine.model.eval()
                 engine.avg_metrics.reset()
-                for batch_val in tqdm(val_dataloader, desc='Val'):
+                if engine.avg_miou is not None:
+                    engine.avg_miou.reset()
+                for batch_val in tqdm(val_dataloader, desc='Val', disable=not accelerator.is_local_main_process):
                     engine.test_step(batch_val)
-                metrics = engine.avg_metrics.value()
-                if use_wandb:
-                    accelerator.log(metrics, step=global_step)
-                    batch_log = {k: batch[k][:1] for k in batch}
-                    image_results = engine.log_images(batch_log, sample=True)
-                    accelerator.log({
-                        "input": wandb.Image(array2grid(image_results['input'])),
-                        "cloudy": wandb.Image(array2grid(image_results['cloudy'])),
-                        "samples": wandb.Image(array2grid(image_results['samples'])),
-                    }, step=global_step)
-                elif accelerator.is_main_process:
-                    file_logger.info(f"Validation metrics at step {global_step}: {metrics}")
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    metrics = engine.avg_metrics.value()
+                    if engine.avg_miou is not None:
+                        metrics.update(engine.avg_miou.value())
+                    if use_wandb:
+                        accelerator.log(metrics, step=global_step)
+                        batch_log = {k: batch[k][:1] for k in batch}
+                        image_results = engine.log_images(batch_log, sample=True)
+                        log_images = {
+                            "input": wandb.Image(array2grid(image_results['input'])),
+                            "cloudy": wandb.Image(array2grid(image_results['cloudy'])),
+                            "samples": wandb.Image(array2grid(image_results['samples'])),
+                        }
+                        if "mask_label" in image_results:
+                            log_images["mask_label"] = wandb.Image(convert_to_color(image_results["mask_label"][0, 0]))
+                        if "mask_pred" in image_results:
+                            log_images["mask_pred"] = wandb.Image(convert_to_color(image_results["mask_pred"][0, 0]))
+                        accelerator.log(log_images, step=global_step)
+                    else:
+                        file_logger.info(f"Validation metrics at step {global_step}: {metrics}")
                 engine.model.train()
+                accelerator.wait_for_everyone()
 
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(),
+                "denoising_loss": accelerator.gather(denoising_loss_mean).mean().detach().item(),
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
             }
+            if seg_loss_mean is not None:
+                logs["seg_loss"] = accelerator.gather(seg_loss_mean).mean().detach().item()
             progress_bar.set_postfix(**logs)
             if use_wandb:
                 accelerator.log(logs, step=global_step)
@@ -308,7 +333,7 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Training")
     parser.add_argument("--exp-name", type=str, default=None)
-    parser.add_argument("--config", type=str, default="config/vaihingen_thick_adahdit_dinojoint_B2_100k.yml")
+    parser.add_argument("--config", type=str, default="config/vaihingen_thick_adahdit_dinojoint_seg_B2_100k.yml")
     args = parser.parse_args()
     return args
 

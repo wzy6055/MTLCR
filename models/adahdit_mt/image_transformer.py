@@ -914,8 +914,439 @@ class DinoJointAdaptor(nn.Module):
 
         return x, pos, cond, control, skips, poses
 
+
+class DinoJointNoCondAdaptor(nn.Module):
+    def __init__(
+        self,
+        model_width,
+        cond_features,
+        d_ff,
+        d_head,
+        latent_dim=1024,
+        branch_depth=2,
+        dropout=0.0,
+        latent_key="cloudy_latent",
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_key = latent_key
+        self.latent_norm = nn.LayerNorm(latent_dim)
+        self.latent_proj = apply_wd(Linear(latent_dim, model_width, bias=False))
+        self.pre_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.branch_blocks = Level(
+            [GlobalTransformerLayer(model_width, d_ff, d_head, cond_features, dropout=dropout) for _ in range(branch_depth)]
+        )
+        self.post_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+
+    def _normalize_control(self, control):
+        if isinstance(control, dict):
+            return dict(control)
+        if control is None:
+            return {}
+        return {"image": control}
+
+    def _prepare_latent(self, latent, pos, dtype, device):
+        if latent is None:
+            return None
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        elif latent.dim() == 4:
+            if latent.shape[-1] == self.latent_dim:
+                pass
+            elif latent.shape[1] == self.latent_dim:
+                latent = latent.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
+            if latent.shape[-3:-1] != pos.shape[:2]:
+                latent = latent.permute(0, 3, 1, 2)
+                latent = F.interpolate(latent, size=tuple(pos.shape[:2]), mode="bilinear", align_corners=False)
+                latent = latent.permute(0, 2, 3, 1)
+            latent = self.latent_norm(latent)
+            return self.latent_proj(latent)
+
+        if latent.dim() != 3:
+            raise ValueError(f"Unsupported latent rank: {latent.dim()}")
+
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dim {self.latent_dim}, got {latent.shape[-1]} for latent shape {tuple(latent.shape)}"
+            )
+
+        latent = self.latent_norm(latent)
+        latent = self.latent_proj(latent)
+        bsz, num_tokens, channels = latent.shape
+        target_h, target_w = pos.shape[:2]
+        if num_tokens == target_h * target_w:
+            latent = latent.view(bsz, target_h, target_w, channels)
+            return latent
+
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"Latent token count {num_tokens} cannot be reshaped into a square grid")
+
+        latent = latent.view(bsz, side, side, channels).permute(0, 3, 1, 2)
+        latent = F.interpolate(latent, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return latent.permute(0, 2, 3, 1)
+
+    def _constant_cond(self, cond):
+        return torch.zeros_like(cond)
+
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        control = self._normalize_control(control)
+        adaptor_cond = self._constant_cond(cond)
+        if stage == "pre_bottleneck":
+            dino_latent = self._prepare_latent(control.get(self.latent_key), pos, x.dtype, x.device)
+            if dino_latent is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.pre_joint(x, dino_latent, pos, adaptor_cond)
+            dino_branch = self.branch_blocks(dino_latent, pos, adaptor_cond)
+            control["dino_branch"] = dino_branch
+            return x, pos, cond, control, skips, poses
+
+        if stage == "post_bottleneck":
+            dino_branch = control.get("dino_branch")
+            if dino_branch is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.post_joint(x, dino_branch.to(dtype=x.dtype, device=x.device), pos, adaptor_cond)
+            control["dino_branch"] = dino_branch
+
+        return x, pos, cond, control, skips, poses
+
+
+class DinoJointBiParallelAdaptor(nn.Module):
+    def __init__(
+        self,
+        model_width,
+        cond_features,
+        d_ff,
+        d_head,
+        latent_dim=1024,
+        branch_depth=2,
+        dropout=0.0,
+        latent_key="cloudy_latent",
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_key = latent_key
+        self.latent_norm = nn.LayerNorm(latent_dim)
+        self.latent_proj = apply_wd(Linear(latent_dim, model_width, bias=False))
+        self.pre_x_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.pre_source_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.branch_blocks = Level(
+            [GlobalTransformerLayer(model_width, d_ff, d_head, cond_features, dropout=dropout) for _ in range(branch_depth)]
+        )
+        self.post_x_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.post_source_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+
+    def _normalize_control(self, control):
+        if isinstance(control, dict):
+            return dict(control)
+        if control is None:
+            return {}
+        return {"image": control}
+
+    def _prepare_latent(self, latent, pos, dtype, device):
+        if latent is None:
+            return None
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        elif latent.dim() == 4:
+            if latent.shape[-1] == self.latent_dim:
+                pass
+            elif latent.shape[1] == self.latent_dim:
+                latent = latent.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
+            if latent.shape[-3:-1] != pos.shape[:2]:
+                latent = latent.permute(0, 3, 1, 2)
+                latent = F.interpolate(latent, size=tuple(pos.shape[:2]), mode="bilinear", align_corners=False)
+                latent = latent.permute(0, 2, 3, 1)
+            latent = self.latent_norm(latent)
+            return self.latent_proj(latent)
+
+        if latent.dim() != 3:
+            raise ValueError(f"Unsupported latent rank: {latent.dim()}")
+
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dim {self.latent_dim}, got {latent.shape[-1]} for latent shape {tuple(latent.shape)}"
+            )
+
+        latent = self.latent_norm(latent)
+        latent = self.latent_proj(latent)
+        bsz, num_tokens, channels = latent.shape
+        target_h, target_w = pos.shape[:2]
+        if num_tokens == target_h * target_w:
+            latent = latent.view(bsz, target_h, target_w, channels)
+            return latent
+
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"Latent token count {num_tokens} cannot be reshaped into a square grid")
+
+        latent = latent.view(bsz, side, side, channels).permute(0, 3, 1, 2)
+        latent = F.interpolate(latent, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return latent.permute(0, 2, 3, 1)
+
+    def _constant_cond(self, cond):
+        return torch.zeros_like(cond)
+
+    def _fuse_features(self, x, source):
+        return 0.5 * (x + source)
+
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        control = self._normalize_control(control)
+        adaptor_cond = self._constant_cond(cond)
+        if stage == "pre_bottleneck":
+            source = self._prepare_latent(control.get(self.latent_key), pos, x.dtype, x.device)
+            if source is None:
+                return x, pos, cond, control, skips, poses
+
+            x_updated = self.pre_x_joint(x, source, pos, adaptor_cond)
+            source_updated = self.pre_source_joint(source, x, pos, adaptor_cond)
+            source_updated = self.branch_blocks(source_updated, pos, adaptor_cond)
+            control["dino_branch"] = source_updated
+            control["seg_features"] = self._fuse_features(x_updated, source_updated)
+            return x_updated, pos, cond, control, skips, poses
+
+        if stage == "post_bottleneck":
+            source = control.get("dino_branch")
+            if source is None:
+                return x, pos, cond, control, skips, poses
+
+            source = source.to(dtype=x.dtype, device=x.device)
+            x_updated = self.post_x_joint(x, source, pos, adaptor_cond)
+            source_updated = self.post_source_joint(source, x, pos, adaptor_cond)
+            control["dino_branch"] = source_updated
+            control["seg_features"] = self._fuse_features(x_updated, source_updated)
+            return x_updated, pos, cond, control, skips, poses
+
+        return x, pos, cond, control, skips, poses
+
+
+class DinoJointBiSequentialAdaptor(nn.Module):
+    def __init__(
+        self,
+        model_width,
+        cond_features,
+        d_ff,
+        d_head,
+        latent_dim=1024,
+        branch_depth=2,
+        dropout=0.0,
+        latent_key="cloudy_latent",
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_key = latent_key
+        self.latent_norm = nn.LayerNorm(latent_dim)
+        self.latent_proj = apply_wd(Linear(latent_dim, model_width, bias=False))
+        self.pre_x_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.pre_source_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.branch_blocks = Level(
+            [GlobalTransformerLayer(model_width, d_ff, d_head, cond_features, dropout=dropout) for _ in range(branch_depth)]
+        )
+        self.post_x_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.post_source_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+
+    def _normalize_control(self, control):
+        if isinstance(control, dict):
+            return dict(control)
+        if control is None:
+            return {}
+        return {"image": control}
+
+    def _prepare_latent(self, latent, pos, dtype, device):
+        if latent is None:
+            return None
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        elif latent.dim() == 4:
+            if latent.shape[-1] == self.latent_dim:
+                pass
+            elif latent.shape[1] == self.latent_dim:
+                latent = latent.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
+            if latent.shape[-3:-1] != pos.shape[:2]:
+                latent = latent.permute(0, 3, 1, 2)
+                latent = F.interpolate(latent, size=tuple(pos.shape[:2]), mode="bilinear", align_corners=False)
+                latent = latent.permute(0, 2, 3, 1)
+            latent = self.latent_norm(latent)
+            return self.latent_proj(latent)
+
+        if latent.dim() != 3:
+            raise ValueError(f"Unsupported latent rank: {latent.dim()}")
+
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dim {self.latent_dim}, got {latent.shape[-1]} for latent shape {tuple(latent.shape)}"
+            )
+
+        latent = self.latent_norm(latent)
+        latent = self.latent_proj(latent)
+        bsz, num_tokens, channels = latent.shape
+        target_h, target_w = pos.shape[:2]
+        if num_tokens == target_h * target_w:
+            latent = latent.view(bsz, target_h, target_w, channels)
+            return latent
+
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"Latent token count {num_tokens} cannot be reshaped into a square grid")
+
+        latent = latent.view(bsz, side, side, channels).permute(0, 3, 1, 2)
+        latent = F.interpolate(latent, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return latent.permute(0, 2, 3, 1)
+
+    def _constant_cond(self, cond):
+        return torch.zeros_like(cond)
+
+    def _fuse_features(self, x, source):
+        return 0.5 * (x + source)
+
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        control = self._normalize_control(control)
+        adaptor_cond = self._constant_cond(cond)
+        if stage == "pre_bottleneck":
+            source = self._prepare_latent(control.get(self.latent_key), pos, x.dtype, x.device)
+            if source is None:
+                return x, pos, cond, control, skips, poses
+
+            x_updated = self.pre_x_joint(x, source, pos, adaptor_cond)
+            source_updated = self.pre_source_joint(source, x_updated, pos, adaptor_cond)
+            source_updated = self.branch_blocks(source_updated, pos, adaptor_cond)
+            control["dino_branch"] = source_updated
+            control["seg_features"] = self._fuse_features(x_updated, source_updated)
+            return x_updated, pos, cond, control, skips, poses
+
+        if stage == "post_bottleneck":
+            source = control.get("dino_branch")
+            if source is None:
+                return x, pos, cond, control, skips, poses
+
+            source = source.to(dtype=x.dtype, device=x.device)
+            x_updated = self.post_x_joint(x, source, pos, adaptor_cond)
+            source_updated = self.post_source_joint(source, x_updated, pos, adaptor_cond)
+            control["dino_branch"] = source_updated
+            control["seg_features"] = self._fuse_features(x_updated, source_updated)
+            return x_updated, pos, cond, control, skips, poses
+
+        return x, pos, cond, control, skips, poses
+
+
+class DinoJointNoBranchAdaptor(nn.Module):
+    def __init__(
+        self,
+        model_width,
+        cond_features,
+        d_head,
+        latent_dim=1024,
+        dropout=0.0,
+        latent_key="cloudy_latent",
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_key = latent_key
+        self.latent_norm = nn.LayerNorm(latent_dim)
+        self.latent_proj = apply_wd(Linear(latent_dim, model_width, bias=False))
+        self.pre_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+        self.post_joint = JointAttentionBlock(model_width, d_head, cond_features, dropout=dropout)
+
+    def _normalize_control(self, control):
+        if isinstance(control, dict):
+            return dict(control)
+        if control is None:
+            return {}
+        return {"image": control}
+
+    def _prepare_latent(self, latent, pos, dtype, device):
+        if latent is None:
+            return None
+
+        latent = latent.to(device=device, dtype=dtype)
+        if latent.dim() == 2:
+            latent = latent.unsqueeze(0)
+        elif latent.dim() == 4:
+            if latent.shape[-1] == self.latent_dim:
+                pass
+            elif latent.shape[1] == self.latent_dim:
+                latent = latent.permute(0, 2, 3, 1)
+            else:
+                raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
+            if latent.shape[-3:-1] != pos.shape[:2]:
+                latent = latent.permute(0, 3, 1, 2)
+                latent = F.interpolate(latent, size=tuple(pos.shape[:2]), mode="bilinear", align_corners=False)
+                latent = latent.permute(0, 2, 3, 1)
+            latent = self.latent_norm(latent)
+            return self.latent_proj(latent)
+
+        if latent.dim() != 3:
+            raise ValueError(f"Unsupported latent rank: {latent.dim()}")
+
+        if latent.shape[-1] != self.latent_dim:
+            raise ValueError(
+                f"Expected latent dim {self.latent_dim}, got {latent.shape[-1]} for latent shape {tuple(latent.shape)}"
+            )
+
+        latent = self.latent_norm(latent)
+        latent = self.latent_proj(latent)
+        bsz, num_tokens, channels = latent.shape
+        target_h, target_w = pos.shape[:2]
+        if num_tokens == target_h * target_w:
+            latent = latent.view(bsz, target_h, target_w, channels)
+            return latent
+
+        side = int(math.sqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(f"Latent token count {num_tokens} cannot be reshaped into a square grid")
+
+        latent = latent.view(bsz, side, side, channels).permute(0, 3, 1, 2)
+        latent = F.interpolate(latent, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return latent.permute(0, 2, 3, 1)
+
+    def forward(self, stage, x, pos, cond, control, skips, poses):
+        control = self._normalize_control(control)
+        if stage == "pre_bottleneck":
+            dino_latent = self._prepare_latent(control.get(self.latent_key), pos, x.dtype, x.device)
+            if dino_latent is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.pre_joint(x, dino_latent, pos, cond)
+            control["dino_branch"] = dino_latent
+            return x, pos, cond, control, skips, poses
+
+        if stage == "post_bottleneck":
+            dino_branch = control.get("dino_branch")
+            if dino_branch is None:
+                return x, pos, cond, control, skips, poses
+
+            x = self.post_joint(x, dino_branch.to(dtype=x.dtype, device=x.device), pos, cond)
+            control["dino_branch"] = dino_branch
+
+        return x, pos, cond, control, skips, poses
+
 class ImageTransformerDenoiserModel(nn.Module):
-    def __init__(self, in_channels, out_channels, patch_size, levels, mapping, tanh=False, control_mode=None, adaptor=None):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        patch_size,
+        levels,
+        mapping,
+        tanh=False,
+        control_mode=None,
+        adaptor=None,
+        segmentation=None,
+    ):
         super(ImageTransformerDenoiserModel, self).__init__()
         assert control_mode in ['sum', 'conv', 'lerp', None], "control_mode must be in ['sum','conv','lerp',None]"
         self.control_mode = control_mode
@@ -962,13 +1393,11 @@ class ImageTransformerDenoiserModel(nn.Module):
         # nn.init.zeros_(self.patch_out.proj.weight)
         self.tanh = nn.Tanh() if tanh else nn.Identity()
         self.adaptors = self._build_adaptors(adaptor, mapping.width, levels)
+        self.segmentation_cfg = segmentation or {}
+        self.seg_decoder = self._build_segmentation_decoder(self.segmentation_cfg, levels)
 
         # for repa
         # self.projector = build_mlp(1024, 2048, 1024)
-
-        # for segmentation
-        # self.seg_projector = build_mlp(1024, 2048, 1024)
-        # self.seg_decoder = ProgressiveUpDecoder(in_channels=1024, num_classes=6)
 
         # init
         self.initialize_weights()
@@ -1003,12 +1432,60 @@ class ImageTransformerDenoiserModel(nn.Module):
         adaptor_type = adaptor_cfg.get("type", "identity")
         if adaptor_type == "identity":
             return IdentityAdaptor()
-        if adaptor_type != "dino_joint":
+        if adaptor_type not in {
+            "dino_joint",
+            "dino_joint_no_branch",
+            "dino_joint_no_cond",
+            "dino_joint_bi_parallel",
+            "dino_joint_bi_sequential",
+        }:
             raise ValueError(f"Unsupported adaptor type: {adaptor_type}")
 
         bottleneck_spec = levels[-1]
         bottleneck_attn = bottleneck_spec.self_attn
         d_head = getattr(bottleneck_attn, "d_head", bottleneck_spec.width)
+        if adaptor_type == "dino_joint_bi_parallel":
+            return DinoJointBiParallelAdaptor(
+                model_width=bottleneck_spec.width,
+                cond_features=cond_width,
+                d_ff=bottleneck_spec.d_ff,
+                d_head=d_head,
+                latent_dim=adaptor_cfg.get("latent_dim", 1024),
+                branch_depth=adaptor_cfg.get("branch_depth", 2),
+                dropout=adaptor_cfg.get("dropout", bottleneck_spec.dropout),
+                latent_key=adaptor_cfg.get("latent_key", "cloudy_latent"),
+            )
+        if adaptor_type == "dino_joint_bi_sequential":
+            return DinoJointBiSequentialAdaptor(
+                model_width=bottleneck_spec.width,
+                cond_features=cond_width,
+                d_ff=bottleneck_spec.d_ff,
+                d_head=d_head,
+                latent_dim=adaptor_cfg.get("latent_dim", 1024),
+                branch_depth=adaptor_cfg.get("branch_depth", 2),
+                dropout=adaptor_cfg.get("dropout", bottleneck_spec.dropout),
+                latent_key=adaptor_cfg.get("latent_key", "cloudy_latent"),
+            )
+        if adaptor_type == "dino_joint_no_cond":
+            return DinoJointNoCondAdaptor(
+                model_width=bottleneck_spec.width,
+                cond_features=cond_width,
+                d_ff=bottleneck_spec.d_ff,
+                d_head=d_head,
+                latent_dim=adaptor_cfg.get("latent_dim", 1024),
+                branch_depth=adaptor_cfg.get("branch_depth", 2),
+                dropout=adaptor_cfg.get("dropout", bottleneck_spec.dropout),
+                latent_key=adaptor_cfg.get("latent_key", "cloudy_latent"),
+            )
+        if adaptor_type == "dino_joint_no_branch":
+            return DinoJointNoBranchAdaptor(
+                model_width=bottleneck_spec.width,
+                cond_features=cond_width,
+                d_head=d_head,
+                latent_dim=adaptor_cfg.get("latent_dim", 1024),
+                dropout=adaptor_cfg.get("dropout", bottleneck_spec.dropout),
+                latent_key=adaptor_cfg.get("latent_key", "cloudy_latent"),
+            )
         return DinoJointAdaptor(
             model_width=bottleneck_spec.width,
             cond_features=cond_width,
@@ -1029,6 +1506,19 @@ class ImageTransformerDenoiserModel(nn.Module):
             adaptor_cfgs = [adaptor_cfg]
         return nn.ModuleList([self._build_single_adaptor(cfg, cond_width, levels) for cfg in adaptor_cfgs])
 
+    def _build_segmentation_decoder(self, segmentation_cfg, levels):
+        if not segmentation_cfg or not segmentation_cfg.get("enabled", False):
+            return None
+
+        return ProgressiveUpDecoder(
+            in_channels=levels[-1].width,
+            num_classes=segmentation_cfg.get("num_classes", 6),
+            mid_channels=segmentation_cfg.get("mid_channels", 256),
+            use_syncbn=segmentation_cfg.get("use_syncbn", False),
+            up_mode=segmentation_cfg.get("up_mode", "bilinear"),
+            dropout_p=segmentation_cfg.get("dropout_p", 0.1),
+        )
+
     def _run_adaptors(self, stage, x, pos, cond, control, skips, poses, adaptor=None):
         if adaptor is None:
             adaptors = self.adaptors
@@ -1042,6 +1532,19 @@ class ImageTransformerDenoiserModel(nn.Module):
         for module in adaptors:
             x, pos, cond, control, skips, poses = module(stage, x, pos, cond, control, skips, poses)
         return x, pos, cond, control, skips, poses
+
+    def _decode_segmentation(self, control):
+        if self.seg_decoder is None or not isinstance(control, dict):
+            return None
+
+        seg_source = self.segmentation_cfg.get("source", "dino_branch")
+        seg_tokens = control.get(seg_source)
+        if seg_tokens is None:
+            return None
+
+        seg_tokens = seg_tokens.to(dtype=self.seg_decoder.classifier.weight.dtype)
+        seg_tokens = seg_tokens.movedim(-1, 1).contiguous()
+        return self.seg_decoder(seg_tokens)
 
     def param_groups(self, base_lr=5e-4, mapping_lr_scale=1 / 3):
         wd = filter_params(lambda tags: "wd" in tags and "mapping" not in tags, self)
@@ -1138,6 +1641,9 @@ class ImageTransformerDenoiserModel(nn.Module):
             "post_bottleneck", x, pos, cond, control, skips, poses, adaptor=adaptor
         )
         result = self.decode(x, skips, poses, cond, control)
+        seg_logits = self._decode_segmentation(control)
+        if seg_logits is not None:
+            result["seg_logits"] = seg_logits
         return result
 
 class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
@@ -1162,7 +1668,8 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
         mapping_dropout_rate=0.0,
         tanh=False,
         control_mode=None,
-        adaptor: Optional[dict] = None
+        adaptor: Optional[dict] = None,
+        segmentation: Optional[dict] = None,
     ):
         assert len(widths) == len(depths)
         assert len(widths) == len(d_ffs)
@@ -1183,7 +1690,17 @@ class ImageTransformerDenoiserModelInterface(ImageTransformerDenoiserModel):
                     raise ValueError(f'unsupported self attention type {self_attn["type"]}')
                 levels.append(LevelSpec(depth, width, d_ff, self_attn, dropout))
         mapping = MappingSpec(mapping_depth, mapping_width, mapping_d_ff, mapping_dropout_rate)
-        super().__init__(in_channels, out_channels, patch_size, levels, mapping, tanh, control_mode, adaptor)
+        super().__init__(
+            in_channels,
+            out_channels,
+            patch_size,
+            levels,
+            mapping,
+            tanh,
+            control_mode,
+            adaptor,
+            segmentation,
+        )
 
 if __name__ == '__main__':
     # import flags, layers
